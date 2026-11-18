@@ -440,4 +440,4 @@ with tabs[5]:
     st.dataframe(ind_full.tail(200).round(2), width="stretch")
     st.download_button("⬇️ Download prices + indicators (CSV)", ind_full.to_csv().encode(), f"{symbol}_analysis.csv", "text/csv")
     st.divider()
-st.caption("© 2026 Rik Karmakar · Built with Streamlit · Educational use only, not investment advice.")
+st.caption("© 2026 Rik Karmakar.")
