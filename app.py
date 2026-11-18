@@ -239,7 +239,7 @@ M = SimpleNamespace(MODELS=MODELS, forecast=forecast)
 st.set_page_config(page_title="Nifty 50 Analytics & Forecast", page_icon="📈", layout="wide")
 st.title("📈 Nifty 50 Analytics & Price Forecast")
 st.caption("Educational tool, not investment advice. Live prices come from Yahoo Finance (NSE data is ~15 min delayed).")
-
+st.markdown("Designed and developed by **Rik Karmakar**")
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("Data")
@@ -439,3 +439,5 @@ with tabs[5]:
     ind_full = I.add_indicators(df)
     st.dataframe(ind_full.tail(200).round(2), width="stretch")
     st.download_button("⬇️ Download prices + indicators (CSV)", ind_full.to_csv().encode(), f"{symbol}_analysis.csv", "text/csv")
+    st.divider()
+st.caption("© 2026 Rik Karmakar · Built with Streamlit · Educational use only, not investment advice.")
