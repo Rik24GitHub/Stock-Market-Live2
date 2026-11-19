@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
 import yfinance as yf
+from scipy import stats as sps
 from plotly.subplots import make_subplots
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import roc_auc_score
@@ -310,13 +312,57 @@ D = SimpleNamespace(NIFTY50=NIFTY50, INDEX_TICKER=INDEX_TICKER, DEFAULT_CSV=DEFA
 I = SimpleNamespace(add_indicators=add_indicators, drawdown=drawdown, risk_stats=risk_stats)
 M = SimpleNamespace(MODELS=MODELS, forecast=forecast, spike_probs=spike_probs, rank_universe=rank_universe)
 
+# ===== Visual theme =====
+UP, DOWN = "#00c896", "#ff5c7a"
+COLORWAY = ["#00c896", "#6c8cff", "#f5a524", "#ff5c7a", "#b388ff", "#4dd0e1", "#ffd54f"]
+_grid = "rgba(128,128,128,0.18)"
+pio.templates["nifty"] = go.layout.Template(layout=dict(
+    colorway=COLORWAY, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#8b949e", size=13),
+    xaxis=dict(gridcolor=_grid, zerolinecolor=_grid, linecolor=_grid),
+    yaxis=dict(gridcolor=_grid, zerolinecolor=_grid, linecolor=_grid),
+    legend=dict(orientation="h", y=1.08, x=0), margin=dict(l=10, r=10, t=60, b=10),
+    title=dict(font=dict(size=16)),
+))
+pio.templates.default = "nifty"
+RSI_STEPS = [{"range": [0, 30], "color": "rgba(0,200,150,.25)"},
+             {"range": [30, 70], "color": "rgba(128,128,128,.12)"},
+             {"range": [70, 100], "color": "rgba(255,92,122,.28)"}]
+
+
+def show(fig, width="stretch"):
+    st.plotly_chart(fig, theme=None, width=width)
+
+
+def show_in(where, fig, width="stretch"):
+    where.plotly_chart(fig, theme=None, width=width)
+
+
+def gauge(value, title, lo=0, hi=100, steps=None, color=UP, suffix=""):
+    v = float(np.nan_to_num(value))
+    fig = go.Figure(go.Indicator(mode="gauge+number", value=v, number={"suffix": suffix, "valueformat": ".1f"},
+                                 title={"text": title, "font": {"size": 15}},
+                                 gauge={"axis": {"range": [lo, hi]}, "bar": {"color": color, "thickness": 0.3},
+                                        "steps": steps or [], "borderwidth": 0}))
+    fig.update_layout(height=230, margin=dict(l=25, r=25, t=55, b=5))
+    return fig
+
+
 # ===== UI =====
 
 
 st.set_page_config(page_title="Nifty 50 Analytics & Forecast", page_icon="📈", layout="wide")
-st.title("📈 Nifty 50 Analytics & Price Forecast")
+st.markdown("""<style>
+.block-container{padding-top:2rem;max-width:1250px}
+.hero{background:linear-gradient(120deg,#00a67e 0%,#2f6bff 55%,#7a3cff 100%);border-radius:18px;padding:26px 32px;margin-bottom:14px;color:#fff}
+.hero h1{margin:0;font-size:2rem;color:#fff;padding:0}
+.hero p{margin:6px 0 10px 0;opacity:.92;font-size:1.02rem}
+.hero .by{display:inline-block;background:rgba(255,255,255,.18);border-radius:999px;padding:4px 14px;font-size:.88rem}
+div[data-testid="stMetric"]{background:rgba(128,128,128,.08);border:1px solid rgba(128,128,128,.22);border-radius:14px;padding:14px 16px}
+button[data-baseweb="tab"]{font-weight:600;font-size:.98rem}
+</style>""", unsafe_allow_html=True)
+st.markdown("""<div class="hero"><h1>📈 Nifty 50 Analytics &amp; Price Forecast</h1><p>Technical charts · risk analytics · ML forecasts · spike alerts · 5-day watchlist</p><span class="by">Designed and developed by <b>Rik Karmakar</b></span></div>""", unsafe_allow_html=True)
 st.caption("Educational tool, not investment advice. Live prices come from Yahoo Finance (NSE data is ~15 min delayed).")
-st.markdown("Designed and developed by **Rik Karmakar**")
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
@@ -397,17 +443,26 @@ with tabs[0]:
     if bb:
         for col in ("BB_up", "BB_low"):
             fig.add_trace(go.Scatter(x=ind.index, y=ind[col], name=col, line=dict(width=1, dash="dot")), 1, 1)
-    fig.add_trace(go.Bar(x=ind.index, y=ind.Volume, name="Volume", marker_opacity=0.5), 2, 1)
+    fig.add_trace(go.Bar(x=ind.index, y=ind.Volume, name="Volume", marker_color=np.where(ind.Close >= ind.Open, UP, DOWN), marker_opacity=0.55), 2, 1)
     fig.add_trace(go.Scatter(x=ind.index, y=ind.RSI, name="RSI(14)"), 3, 1)
     for lvl in (30, 70):
         fig.add_hline(y=lvl, line_dash="dot", row=3, col=1)
     fig.add_trace(go.Scatter(x=ind.index, y=ind.MACD, name="MACD"), 4, 1)
     fig.add_trace(go.Scatter(x=ind.index, y=ind.MACD_signal, name="Signal"), 4, 1)
-    fig.add_trace(go.Bar(x=ind.index, y=ind.MACD - ind.MACD_signal, name="Hist", marker_opacity=0.5), 4, 1)
+    fig.add_trace(go.Bar(x=ind.index, y=ind.MACD - ind.MACD_signal, name="Hist", marker_color=np.where(ind.MACD >= ind.MACD_signal, UP, DOWN), marker_opacity=0.6), 4, 1)
+    fig.update_traces(increasing_line_color=UP, decreasing_line_color=DOWN, increasing_fillcolor=UP,
+                      decreasing_fillcolor=DOWN, selector=dict(type="candlestick"))
+    fig.add_hrect(y0=70, y1=100, row=3, col=1, fillcolor=DOWN, opacity=0.08, line_width=0)
+    fig.add_hrect(y0=0, y1=30, row=3, col=1, fillcolor=UP, opacity=0.08, line_width=0)
     fig.update_layout(height=820, xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.03),
                       margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, width="stretch")
+    show(fig, width="stretch")
     rsi = ind.RSI.iloc[-1]
+    g1, g2, g3 = st.columns(3)
+    show_in(g1, gauge(rsi, "RSI (14)", 0, 100, RSI_STEPS))
+    gap50 = (ind.Close.iloc[-1] / ind.SMA50.iloc[-1] - 1) * 100
+    show_in(g2, gauge(gap50, "Distance from 50-day avg (%)", -15, 15, None, "#6c8cff", "%"))
+    show_in(g3, gauge(ind.Ret.tail(20).std() * np.sqrt(252) * 100, "20-day volatility (ann.)", 0, 60, None, "#f5a524", "%"))
     st.info(f"RSI(14) = **{rsi:.1f}** → " + ("overbought (>70)" if rsi > 70 else "oversold (<30)" if rsi < 30 else "neutral")
             + f" · MACD is **{'above' if ind.MACD.iloc[-1] > ind.MACD_signal.iloc[-1] else 'below'}** its signal line.")
 
@@ -416,35 +471,38 @@ with tabs[1]:
     j = pd.concat([df.Close, bench.Close], axis=1, join="inner").dropna()
     j.columns = [symbol, bench_name]
     reb = j / j.iloc[0] * 100
-    st.plotly_chart(px.line(reb, title="Rebased to 100").update_layout(height=380, legend_title=""), width="stretch")
+    show(px.line(reb, title="Rebased to 100").update_layout(height=380, legend_title=""), width="stretch")
     a, b = st.columns(2)
     rs = (reb[symbol] / reb[bench_name]).rename("Relative strength")
-    a.plotly_chart(px.line(rs, title=f"{symbol} ÷ {bench_name} (rising = outperforming)").update_layout(height=320, showlegend=False), width="stretch")
+    show_in(a, px.line(rs, title=f"{symbol} ÷ {bench_name} (rising = outperforming)").update_layout(height=320, showlegend=False), width="stretch")
     r = j.pct_change().dropna()
     win = st.slider("Rolling beta window (days)", 20, 250, 60)
     beta = (r[symbol].rolling(win).cov(r[bench_name]) / r[bench_name].rolling(win).var()).rename("Beta")
-    b.plotly_chart(px.line(beta, title=f"Rolling {win}-day beta").update_layout(height=320, showlegend=False), width="stretch")
+    show_in(b, px.line(beta, title=f"Rolling {win}-day beta").update_layout(height=320, showlegend=False), width="stretch")
     slope, icpt = np.polyfit(r[bench_name], r[symbol], 1)
     sc = px.scatter(r, x=bench_name, y=symbol, opacity=0.5, title="Daily returns: stock vs benchmark")
     xs = np.array([r[bench_name].min(), r[bench_name].max()])
     sc.add_trace(go.Scatter(x=xs, y=slope * xs + icpt, name=f"β = {slope:.2f}", line=dict(color="orange")))
-    st.plotly_chart(sc.update_layout(height=420), width="stretch")
+    show(sc.update_layout(height=420), width="stretch")
 
 # ------------------------------------------------------------------ risk
 with tabs[2]:
     stats = I.risk_stats(df.Close, bench.Close)
     tbl = pd.DataFrame({"Metric": list(stats), "Value": [
         f"{v:.2f}" if ("Sharpe" in n or "Beta" in n or "Correlation" in n) else f"{v:.2%}" for n, v in stats.items()]})
-    a, b = st.columns([1, 2])
-    a.dataframe(tbl, hide_index=True, width="stretch")
+    items = list(zip(tbl.Metric, tbl.Value))
+    for i in range(0, len(items), 4):
+        for col, (n, v) in zip(st.columns(4), items[i:i + 4]):
+            col.metric(n, v)
+    b = st.container()
     ret = df.Close.pct_change().dropna()
-    b.plotly_chart(px.histogram(ret, nbins=60, title="Daily return distribution").update_layout(height=330, showlegend=False), width="stretch")
+    show_in(b, px.histogram(ret, nbins=60, title="Daily return distribution").update_layout(height=330, showlegend=False), width="stretch")
     a, b = st.columns(2)
-    a.plotly_chart(px.area(I.drawdown(df.Close), title="Drawdown").update_layout(height=300, showlegend=False), width="stretch")
-    b.plotly_chart(px.line(ret.rolling(30).std() * np.sqrt(252), title="30-day annualised volatility").update_layout(height=300, showlegend=False), width="stretch")
+    show_in(a, px.area(I.drawdown(df.Close), title="Drawdown").update_traces(line_color=DOWN, fillcolor="rgba(255,92,122,.3)").update_layout(height=300, showlegend=False), width="stretch")
+    show_in(b, px.line(ret.rolling(30).std() * np.sqrt(252), title="30-day annualised volatility").update_layout(height=300, showlegend=False), width="stretch")
     m = df.Close.groupby(df.index.to_period("M")).last().pct_change().dropna()
     hm = pd.DataFrame({"Year": m.index.year, "Month": m.index.month, "Ret": m.values}).pivot(index="Year", columns="Month", values="Ret")
-    st.plotly_chart(px.imshow(hm * 100, text_auto=".1f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
+    show(px.imshow(hm * 100, text_auto=".1f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
                               title="Monthly returns (%)", aspect="auto"), width="stretch")
 
 # ------------------------------------------------------------------ multi-stock
@@ -461,8 +519,8 @@ with tabs[3]:
             shown = cm[[p for p in picks if p in cm.columns]] if len(picks) >= 2 else cm.iloc[:, :5]
         else:
             shown = cm
-        st.plotly_chart(px.line(shown / shown.bfill().iloc[0] * 100, title="Rebased to 100").update_layout(height=380), width="stretch")
-        st.plotly_chart(px.imshow(shown.pct_change().corr(), text_auto=".2f", color_continuous_scale="RdBu_r",
+        show(px.line(shown / shown.bfill().iloc[0] * 100, title="Rebased to 100").update_layout(height=380), width="stretch")
+        show(px.imshow(shown.pct_change().corr(), text_auto=".2f", color_continuous_scale="RdBu_r",
                                   zmin=-1, zmax=1, title="Return correlation"), width="stretch")
         if allstocks:
             def pr(n):
@@ -507,10 +565,10 @@ with tabs[4]:
                                 name="Forecast", mode="lines+markers", line=dict(dash="dash", color="orange")))
         f1.add_trace(go.Scatter(x=[res["target_date"]] * 2, y=[res["low"], res["high"]], name="80% range",
                                 mode="lines", line=dict(width=6, color="rgba(255,165,0,.4)")))
-        st.plotly_chart(f1.update_layout(height=360, title="Forecast"), width="stretch")
+        show(f1.update_layout(height=360, title="Forecast"), width="stretch")
         bt = res["backtest"]
-        st.plotly_chart(px.line(bt[["Actual", "Predicted"]], title=f"Backtest on unseen data ({horizon}-day-ahead price)").update_layout(height=360), width="stretch")
-        st.plotly_chart(px.bar(res["importance"], orientation="h", title="Feature importance").update_layout(height=380, showlegend=False), width="stretch")
+        show(px.line(bt[["Actual", "Predicted"]], title=f"Backtest on unseen data ({horizon}-day-ahead price)").update_layout(height=360), width="stretch")
+        show(px.bar(res["importance"], orientation="h", title="Feature importance").update_layout(height=380, showlegend=False), width="stretch")
 
 # ------------------------------------------------------------------ spikes
 with tabs[5]:
@@ -537,9 +595,12 @@ with tabs[5]:
             st.warning("On held-out data the " + " and ".join(weak) + " model(s) showed little skill (AUC near 0.5 = coin flip). Treat those probabilities as roughly the stock's normal rate.")
         else:
             st.success("Both models ranked risky days better than chance on held-out data (AUC > 0.55). Still no guarantee.")
+        g1, g2 = st.columns(2)
+        show_in(g1, gauge(up["prob"] * 100, f"Chance of rally ≥ {thr:.1%} in {win}d", 0, 100, None, UP, "%"))
+        show_in(g2, gauge(dn["prob"] * 100, f"Chance of drop ≥ {thr:.1%} in {win}d", 0, 100, None, DOWN, "%"))
         bars = pd.DataFrame({"Model now": [up["prob"], dn["prob"]], "Normal rate (test period)": [up["base_rate"], dn["base_rate"]]},
                             index=["Rally", "Drop"])
-        st.plotly_chart(px.bar(bars, barmode="group", title="Spike probability vs normal rate").update_layout(height=340, yaxis_tickformat=".0%"), width="stretch")
+        show(px.bar(bars, barmode="group", title="Spike probability vs normal rate").update_layout(height=340, yaxis_tickformat=".0%"), width="stretch")
         st.caption(f"When the rally model was in its top 20% most confident days, a rally actually followed {up['top_hit']:.1%} of the time vs {up['base_rate']:.1%} normally." if not np.isnan(up["top_hit"]) else "")
 
 # ------------------------------------------------------------------ picks
@@ -572,13 +633,33 @@ with tabs[6]:
             if res.empty:
                 st.info("No stock passed that filter right now. That is a normal, honest outcome for short-term forecasts.")
             else:
-                res["Beat baseline"] = res["Beat baseline"].map({True: "✅", False: "❌"})
-                fmt = {"Last close": "₹{:,.2f}", "Expected return": "{:+.2%}", "P(spike up)": "{:.1%}", "P(drop)": "{:.1%}",
-                       "RSI": "{:.0f}", "Vol 20d": "{:.0%}", "Score": "{:.0f}"}
+                disp = res.copy()
+                disp["Beat baseline"] = disp["Beat baseline"].map({True: "✅", False: "❌"})
+                for col in ("Expected return", "P(spike up)", "P(drop)", "Vol 20d"):
+                    disp[col] = disp[col] * 100
+                cfg = {
+                    "Last close": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Expected return": st.column_config.NumberColumn(format="%.2f%%"),
+                    "P(spike up)": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
+                    "P(drop)": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
+                    "RSI": st.column_config.NumberColumn(format="%.0f"),
+                    "Vol 20d": st.column_config.NumberColumn(format="%.0f%%"),
+                    "Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+                }
                 st.subheader("Top 5 by score")
-                st.dataframe(res.head(5).style.format(fmt), hide_index=True, width="stretch")
-                with st.expander("Full ranking"):
-                    st.dataframe(res.style.format(fmt), hide_index=True, width="stretch")
+                for col, (_, r) in zip(st.columns(5), res.head(5).iterrows()):
+                    col.metric(r["Symbol"], f"₹{r['Last close']:,.0f}", f"{r['Expected return']:+.2%} expected")
+                    col.caption(f"Score {r['Score']:.0f} · up {r['P(spike up)']:.0%} · drop {r['P(drop)']:.0%} · {'✅' if r['Beat baseline'] else '❌'}")
+                sc = px.scatter(res, x=res["Expected return"] * 100, y=(res["P(spike up)"] - res["P(drop)"]) * 100,
+                                size="Score", color="Score", text="Symbol", size_max=30,
+                                color_continuous_scale=[DOWN, "#f5c542", UP],
+                                labels={"x": "Expected return (%)", "y": "P(spike up) minus P(drop) (pct. points)"},
+                                title="Stock map: top-right = best model outlook")
+                sc.add_hline(y=0, line_dash="dot", line_color="gray")
+                sc.add_vline(x=0, line_dash="dot", line_color="gray")
+                sc.update_traces(textposition="top center")
+                show(sc.update_layout(height=500))
+                st.dataframe(disp, column_config=cfg, hide_index=True, width="stretch")
                 st.caption("Score (0-100) = average percentile of the model's expected return and of (P(spike up) minus P(drop)). Expected return comes from a Ridge model; spike probabilities from random-forest classifiers.")
 
 # ------------------------------------------------------------------ data
@@ -586,6 +667,153 @@ with tabs[7]:
     ind_full = I.add_indicators(df)
     st.dataframe(ind_full.tail(200).round(2), width="stretch")
     st.download_button("⬇️ Download prices + indicators (CSV)", ind_full.to_csv().encode(), f"{symbol}_analysis.csv", "text/csv")
+
+# ------------------------------------------------------------------ analytics dashboard
+BLUE, AMBER = "#6c8cff", "#f5a524"
+
+
+def _rsi(c, n=14):
+    d = c.diff()
+    up_, dn_ = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean(), (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up_ / dn_)
+
+
+def metric_series(close, metric, wn, volume=None):
+    r = close.pct_change()
+    return {"Close price": close, "Daily return": r, "Cumulative return": close / close.iloc[0] - 1,
+            "Rolling volatility (annualised)": r.rolling(wn).std() * np.sqrt(252),
+            "Rolling return": close.pct_change(wn), "Drawdown": I.drawdown(close),
+            "Rolling Sharpe": (r.rolling(wn).mean() * 252 - 0.065) / (r.rolling(wn).std() * np.sqrt(252)),
+            "RSI": _rsi(close), "Volume": volume if volume is not None else close * np.nan}[metric]
+
+
+def close_for(syms):
+    cm = D.fetch_close_matrix_live(tuple(syms), period) if live else D.kaggle_close_matrix(kdf)[list(syms)]
+    return cm.loc[rng[0]:rng[1]]
+
+
+st.divider()
+with st.expander("🔬 Analytics dashboard: analyse this stock in depth", expanded=False):
+    A = st.tabs(["🧰 Chart builder", "📐 Statistics", "📅 Seasonality", "🎲 Monte Carlo", "🧮 Calculators"])
+
+    with A[0]:
+        a1, a2, a3 = st.columns(3)
+        met = a1.selectbox("Metric", ["Close price", "Daily return", "Cumulative return", "Rolling volatility (annualised)",
+                                      "Rolling return", "Drawdown", "Rolling Sharpe", "RSI", "Volume"])
+        wn = a2.slider("Window (days)", 5, 250, 30, key="cb_w")
+        kind = a3.radio("Style", ["Line", "Area", "Bars"], horizontal=True)
+        extras = st.multiselect("Compare with other stocks", [u for u in universe if u != symbol], max_selections=4) if met != "Volume" else []
+        out = metric_series(df.Close, met, wn, df.Volume).rename(symbol).to_frame()
+        if extras:
+            try:
+                cx = close_for(extras)
+                for e in cx.columns:
+                    out[e] = metric_series(cx[e].dropna(), met, wn)
+            except Exception as e:
+                st.warning(f"Could not load comparison stocks: {e}")
+        out = out.dropna(how="all")
+        pct_metrics = {"Daily return", "Cumulative return", "Rolling volatility (annualised)", "Rolling return", "Drawdown"}
+        fx = {"Line": px.line, "Area": px.area, "Bars": px.bar}[kind](out, title=f"{met}" + (f" ({wn}d)" if "Rolling" in met else ""))
+        if met in pct_metrics:
+            fx.update_layout(yaxis_tickformat=".1%")
+        show(fx.update_layout(height=420, hovermode="x unified"))
+        st.dataframe(out.describe().T.style.format("{:,.4f}"), width="stretch")
+
+    with A[1]:
+        r = df.Close.pct_change().dropna()
+        conf = st.slider("VaR / CVaR confidence (%)", 90, 99, 95)
+        var = r.quantile(1 - conf / 100)
+        jb_stat, jb_p = sps.jarque_bera(r)
+        left, right = st.columns([1, 1])
+        summ = {"Mean daily return": f"{r.mean():.3%}", "Daily volatility": f"{r.std():.3%}", "Skewness": f"{r.skew():.2f}",
+                "Excess kurtosis": f"{r.kurt():.2f}", "Up days": f"{(r > 0).mean():.1%}", f"VaR {conf}% (1-day)": f"{var:.2%}",
+                f"CVaR {conf}% (1-day)": f"{r[r <= var].mean():.2%}", "Jarque-Bera p-value": f"{jb_p:.4f}"}
+        left.dataframe(pd.DataFrame({"Value": summ}), width="stretch")
+        left.caption("A small Jarque-Bera p-value (<0.05) means returns are NOT normally distributed (fat tails), which is typical for stocks.")
+        osm, osr = sps.probplot(r, dist="norm", fit=False)
+        qq = go.Figure(go.Scatter(x=osm, y=osr, mode="markers", name="Returns", marker=dict(size=4, opacity=0.6)))
+        qq.add_trace(go.Scatter(x=[osm.min(), osm.max()], y=[r.mean() + r.std() * osm.min(), r.mean() + r.std() * osm.max()],
+                                name="Normal", line=dict(color=AMBER)))
+        show_in(right, qq.update_layout(height=340, title="Q-Q plot vs normal", xaxis_title="Theoretical", yaxis_title="Actual"))
+        ac = pd.Series([r.autocorr(l) for l in range(1, 21)], index=range(1, 21))
+        band = 1.96 / np.sqrt(len(r))
+        fa = go.Figure(go.Bar(x=ac.index, y=ac, marker_color=np.where(ac.abs() > band, AMBER, BLUE), name="Autocorrelation"))
+        fa.add_hline(y=band, line_dash="dot")
+        fa.add_hline(y=-band, line_dash="dot")
+        show(fa.update_layout(height=300, title="Return autocorrelation (bars beyond the dotted lines are statistically notable)", xaxis_title="Lag (days)"))
+
+    with A[2]:
+        r = df.Close.pct_change().dropna()
+        s1, s2 = st.columns(2)
+        dow = r.groupby(r.index.dayofweek).mean() * 100
+        dow.index = [["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i] for i in dow.index]
+        show_in(s1, go.Figure(go.Bar(x=dow.index, y=dow, marker_color=np.where(dow >= 0, UP, DOWN))).update_layout(
+            height=320, title="Average return by weekday (%)", showlegend=False))
+        mm = df.Close.groupby(df.index.to_period("M")).last().pct_change().dropna()
+        moy = mm.groupby(mm.index.month).mean() * 100
+        moy.index = [["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][i - 1] for i in moy.index]
+        show_in(s2, go.Figure(go.Bar(x=moy.index, y=moy, marker_color=np.where(moy >= 0, UP, DOWN))).update_layout(
+            height=320, title="Average return by month (%)", showlegend=False))
+        st.caption("Seasonal averages are noisy and often vanish out of sample. Use a long date range and treat them as curiosities, not signals.")
+
+    with A[3]:
+        m1, m2, m3 = st.columns(3)
+        days = m1.slider("Days ahead", 5, 252, 30)
+        sims = m2.select_slider("Simulations", [200, 500, 1000, 2000], 1000)
+        target = m3.number_input("Target price (₹)", value=float(round(last * 1.05, 2)), step=1.0)
+        how = st.radio("Return model", ["Bootstrap (resample actual returns)", "Normal (random walk with drift)"], horizontal=True)
+        lr = np.log(df.Close).diff().dropna().tail(756)
+        gen = np.random.default_rng(42)
+        draws = gen.choice(lr.to_numpy(), size=(sims, days)) if how.startswith("Bootstrap") else gen.normal(lr.mean(), lr.std(), (sims, days))
+        paths = last * np.exp(np.cumsum(draws, axis=1))
+        q = np.percentile(paths, [5, 25, 50, 75, 95], axis=0)
+        xs = pd.bdate_range(df.index[-1], periods=days + 1)[1:]
+        fm = go.Figure()
+        fm.add_trace(go.Scatter(x=xs, y=q[4], line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fm.add_trace(go.Scatter(x=xs, y=q[0], fill="tonexty", fillcolor="rgba(108,140,255,.15)", line=dict(width=0), name="5-95%"))
+        fm.add_trace(go.Scatter(x=xs, y=q[3], line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fm.add_trace(go.Scatter(x=xs, y=q[1], fill="tonexty", fillcolor="rgba(108,140,255,.30)", line=dict(width=0), name="25-75%"))
+        fm.add_trace(go.Scatter(x=xs, y=q[2], line=dict(color=UP, width=2.5), name="Median"))
+        fm.add_hline(y=target, line_dash="dash", line_color=AMBER, annotation_text="Target")
+        fm.add_trace(go.Scatter(x=df.index[-90:], y=df.Close.tail(90), name="Recent close", line=dict(color="rgba(200,200,200,.8)")))
+        show(fm.update_layout(height=420, title="Simulated price paths (fan chart)"))
+        hit = float((paths.max(axis=1) >= target).mean()) if target > last else float((paths.min(axis=1) <= target).mean())
+        k = st.columns(4)
+        k[0].metric("Median final price", f"₹{q[2][-1]:,.2f}", f"{q[2][-1] / last - 1:+.1%}")
+        k[1].metric("5th to 95th pct", f"₹{q[0][-1]:,.0f} – ₹{q[4][-1]:,.0f}")
+        k[2].metric("P(finish above today)", f"{(paths[:, -1] > last).mean():.0%}")
+        k[3].metric("P(touch target)", f"{hit:.0%}")
+        st.caption("Based only on this stock's past return distribution. It ignores news, earnings and regime changes; it shows a range of outcomes, not a forecast.")
+
+    with A[4]:
+        l, rr = st.columns(2)
+        with l:
+            st.subheader("What-if investment")
+            amt = st.number_input("Amount invested (₹)", min_value=1000, value=100000, step=5000)
+            start = st.date_input("Invested on", value=df.index[max(0, len(df) - 252)].date(),
+                                  min_value=df.index[0].date(), max_value=df.index[-2].date())
+            i0 = min(int(df.index.searchsorted(pd.Timestamp(start))), len(df) - 2)
+            val = amt * last / df.Close.iloc[i0]
+            bser = bench.Close.reindex(df.index, method="ffill")
+            bval = amt * bser.iloc[-1] / bser.iloc[i0]
+            yrs = max((df.index[-1] - df.index[i0]).days / 365.25, 1e-6)
+            w1, w2 = st.columns(2)
+            w1.metric(f"{symbol} value today", f"₹{val:,.0f}", f"{val / amt - 1:+.1%}")
+            w2.metric(f"{bench_name} value today", f"₹{bval:,.0f}", f"{bval / amt - 1:+.1%}")
+            st.caption(f"{symbol} annualised: {(val / amt) ** (1 / yrs) - 1:+.1%} over {yrs:.1f} years. Past performance does not predict the future.")
+        with rr:
+            st.subheader("Position sizing (ATR stop)")
+            cap = st.number_input("Trading capital (₹)", min_value=10000, value=500000, step=10000)
+            rk = st.slider("Risk per trade (% of capital)", 0.25, 5.0, 1.0, 0.25)
+            kx = st.slider("Stop distance (× ATR)", 1.0, 4.0, 2.0, 0.5)
+            atr = float(I.add_indicators(df).ATR.iloc[-1])
+            risk_ps = kx * atr
+            shares = int((cap * rk / 100) // risk_ps) if risk_ps > 0 else 0
+            z = st.columns(3)
+            z[0].metric("Shares", f"{shares:,}")
+            z[1].metric("Stop price", f"₹{last - risk_ps:,.2f}", f"-{risk_ps / last:.1%}", delta_color="inverse")
+            z[2].metric("2R target", f"₹{last + 2 * risk_ps:,.2f}", f"+{2 * risk_ps / last:.1%}")
+            st.caption(f"Position value ₹{shares * last:,.0f} ({shares * last / cap:.0%} of capital). Illustrative long position, not advice.")
 
 st.divider()
 st.caption("© 2026 Rik Karmakar · Built with Streamlit · Educational use only, not investment advice.")
