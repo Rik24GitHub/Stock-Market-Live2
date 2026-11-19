@@ -11,7 +11,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -71,6 +72,21 @@ def fetch_close_matrix_live(symbols: tuple, period: str = "1y") -> pd.DataFrame:
     raw.columns = [str(c).replace(".NS", "") for c in raw.columns]
     raw.index = pd.to_datetime(raw.index).tz_localize(None).normalize()
     return raw
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_ohlcv_many(symbols: tuple, period: str = "3y") -> dict:
+    raw = yf.download([to_yahoo(s) for s in symbols], period=period, interval="1d",
+                      auto_adjust=True, progress=False, threads=True, group_by="ticker")
+    out = {}
+    for s in symbols:
+        try:
+            sub = raw[to_yahoo(s)].dropna(subset=["Close"])
+        except Exception:
+            continue
+        if len(sub) > 300:
+            out[s] = _tidy(sub)
+    return out
 
 
 # ------------------------------------------------------------- Kaggle data
@@ -226,12 +242,73 @@ def forecast(df: pd.DataFrame, model_name: str, horizon: int = 5, test_frac: flo
         "importance": pd.Series(imp, index=X.columns).sort_values(),
     }
 
+
+def spike_probs(df, horizon=5, thr=0.03, n_trees=200, test_frac=0.2):
+    """P(high >= +thr) and P(low <= -thr) within the next `horizon` trading days."""
+    X = make_features(df)
+    hi = pd.concat([df.High.shift(-k) for k in range(1, horizon + 1)], axis=1).max(axis=1, skipna=False)
+    lo = pd.concat([df.Low.shift(-k) for k in range(1, horizon + 1)], axis=1).min(axis=1, skipna=False)
+    targets = {"up": (hi / df.Close - 1 >= thr).astype(float).where(hi.notna()),
+               "down": (lo / df.Close - 1 <= -thr).astype(float).where(lo.notna())}
+    live_row = X.iloc[[-1]]
+    out = {}
+    for name, y in targets.items():
+        lab = X.join(y.rename("y")).dropna()
+        if len(lab) < 250 or live_row.isna().any().any():
+            raise ValueError("Need at least ~1.5 years of daily data.")
+        split = int(len(lab) * (1 - test_frac))
+        train, test = lab.iloc[: split - horizon], lab.iloc[split:]
+        res = {"base_rate": float(test.y.mean()), "auc": np.nan, "top_hit": np.nan, "n_test": len(test)}
+        if train.y.nunique() < 2 or lab.y.nunique() < 2:
+            res["prob"] = float(lab.y.mean())
+            out[name] = res
+            continue
+        mk = lambda: RandomForestClassifier(n_estimators=n_trees, min_samples_leaf=20, max_depth=8,
+                                            n_jobs=-1, random_state=42)
+        clf = mk().fit(train[X.columns], train.y)
+        p = clf.predict_proba(test[X.columns])[:, 1]
+        if test.y.nunique() == 2:
+            res["auc"] = float(roc_auc_score(test.y, p))
+        sel = p >= np.quantile(p, 0.8)
+        if sel.any():
+            res["top_hit"] = float(test.y.to_numpy()[sel].mean())
+        final = mk().fit(lab[X.columns], lab.y)
+        res["prob"] = float(final.predict_proba(live_row)[0, 1])
+        out[name] = res
+    return out
+
+
+def rank_universe(frames, horizon=5, thr=0.03, progress=None):
+    rows = []
+    for i, (sym, d) in enumerate(frames.items()):
+        try:
+            f = forecast(d, "Ridge (linear)", horizon)
+            sp = spike_probs(d, horizon, thr, 60)
+            rows.append({
+                "Symbol": sym, "Last close": f["last_close"],
+                "Expected return": f["price"] / f["last_close"] - 1,
+                "Beat baseline": f["metrics"]["Model MAPE"] < f["metrics"]["Naive MAPE"],
+                "P(spike up)": sp["up"]["prob"], "P(drop)": sp["down"]["prob"],
+                "RSI": add_indicators(d).RSI.iloc[-1],
+                "Vol 20d": d.Close.pct_change().tail(20).std() * np.sqrt(252),
+            })
+        except Exception:
+            pass
+        if progress:
+            progress((i + 1) / len(frames), sym)
+    if not rows:
+        return pd.DataFrame()
+    r = pd.DataFrame(rows)
+    r["Score"] = (r["Expected return"].rank(pct=True) + (r["P(spike up)"] - r["P(drop)"]).rank(pct=True)) / 2 * 100
+    return r.sort_values("Score", ascending=False).reset_index(drop=True)
+
 D = SimpleNamespace(NIFTY50=NIFTY50, INDEX_TICKER=INDEX_TICKER, DEFAULT_CSV=DEFAULT_CSV,
                     fetch_live=fetch_live, fetch_close_matrix_live=fetch_close_matrix_live,
                     load_kaggle=load_kaggle, kaggle_stock=kaggle_stock,
-                    kaggle_close_matrix=kaggle_close_matrix, kaggle_proxy=kaggle_proxy)
+                    kaggle_close_matrix=kaggle_close_matrix, kaggle_proxy=kaggle_proxy,
+                    fetch_ohlcv_many=fetch_ohlcv_many)
 I = SimpleNamespace(add_indicators=add_indicators, drawdown=drawdown, risk_stats=risk_stats)
-M = SimpleNamespace(MODELS=MODELS, forecast=forecast)
+M = SimpleNamespace(MODELS=MODELS, forecast=forecast, spike_probs=spike_probs, rank_universe=rank_universe)
 
 # ===== UI =====
 
@@ -240,6 +317,7 @@ st.set_page_config(page_title="Nifty 50 Analytics & Forecast", page_icon="📈",
 st.title("📈 Nifty 50 Analytics & Price Forecast")
 st.caption("Educational tool, not investment advice. Live prices come from Yahoo Finance (NSE data is ~15 min delayed).")
 st.markdown("Designed and developed by **Rik Karmakar**")
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("Data")
@@ -302,7 +380,7 @@ k[2].metric("52-week low", f"₹{yr.Low.min():,.2f}")
 k[3].metric("Volume", f"{df.Volume.iloc[-1]:,.0f}")
 k[4].metric("Data through", str(df.index[-1].date()))
 
-tabs = st.tabs(["📊 Technical", "🆚 vs Nifty 50", "⚠️ Risk & returns", "🧮 Multi-stock", "🔮 Forecast", "💾 Data"])
+tabs = st.tabs(["📊 Technical", "🆚 vs Nifty 50", "⚠️ Risk & returns", "🧮 Multi-stock", "🔮 Forecast", "⚡ Spikes", "🎯 5-day picks", "💾 Data"])
 
 # ------------------------------------------------------------------ technical
 with tabs[0]:
@@ -434,10 +512,80 @@ with tabs[4]:
         st.plotly_chart(px.line(bt[["Actual", "Predicted"]], title=f"Backtest on unseen data ({horizon}-day-ahead price)").update_layout(height=360), width="stretch")
         st.plotly_chart(px.bar(res["importance"], orientation="h", title="Feature importance").update_layout(height=380, showlegend=False), width="stretch")
 
-# ------------------------------------------------------------------ data
+# ------------------------------------------------------------------ spikes
 with tabs[5]:
+    st.caption("Estimates the chance that the stock's high (or low) moves by the chosen size within the next N trading days.")
+    a, b, c = st.columns([2, 2, 1])
+    thr = a.slider("Spike size (%)", 1.0, 10.0, 3.0, 0.5) / 100
+    win = b.slider("Window (trading days)", 1, 10, 5)
+    if c.button("Run spike model", type="primary"):
+        try:
+            with st.spinner("Training spike classifiers..."):
+                st.session_state["sp"] = (symbol, thr, win, M.spike_probs(full, win, thr))
+        except Exception as e:
+            st.error(str(e))
+    sp = st.session_state.get("sp")
+    if sp and sp[:3] == (symbol, thr, win):
+        up, dn = sp[3]["up"], sp[3]["down"]
+        x = st.columns(4)
+        x[0].metric(f"P(rally ≥ {thr:.1%})", f"{up['prob']:.1%}", f"{up['prob'] - up['base_rate']:+.1%} vs normal")
+        x[1].metric(f"P(drop ≥ {thr:.1%})", f"{dn['prob']:.1%}", f"{dn['prob'] - dn['base_rate']:+.1%} vs normal", delta_color="inverse")
+        x[2].metric("Rally model AUC", "n/a" if np.isnan(up["auc"]) else f"{up['auc']:.2f}")
+        x[3].metric("Drop model AUC", "n/a" if np.isnan(dn["auc"]) else f"{dn['auc']:.2f}")
+        weak = [n for n, r in (("rally", up), ("drop", dn)) if np.isnan(r["auc"]) or r["auc"] < 0.55]
+        if weak:
+            st.warning("On held-out data the " + " and ".join(weak) + " model(s) showed little skill (AUC near 0.5 = coin flip). Treat those probabilities as roughly the stock's normal rate.")
+        else:
+            st.success("Both models ranked risky days better than chance on held-out data (AUC > 0.55). Still no guarantee.")
+        bars = pd.DataFrame({"Model now": [up["prob"], dn["prob"]], "Normal rate (test period)": [up["base_rate"], dn["base_rate"]]},
+                            index=["Rally", "Drop"])
+        st.plotly_chart(px.bar(bars, barmode="group", title="Spike probability vs normal rate").update_layout(height=340, yaxis_tickformat=".0%"), width="stretch")
+        st.caption(f"When the rally model was in its top 20% most confident days, a rally actually followed {up['top_hit']:.1%} of the time vs {up['base_rate']:.1%} normally." if not np.isnan(up["top_hit"]) else "")
+
+# ------------------------------------------------------------------ picks
+with tabs[6]:
+    st.warning("A model-ranked watchlist for the next few trading days, NOT investment advice. Short-term moves are mostly noise; check the 'Beat baseline' column before giving any row weight.")
+    if not live:
+        st.info("Switch the sidebar Source to 'Live (Yahoo Finance)' to scan the Nifty 50.")
+    else:
+        a, b, c = st.columns([2, 2, 1])
+        ph = a.slider("Horizon (trading days)", 1, 10, 5, key="ph")
+        pthr = b.slider("Spike size for risk columns (%)", 1.0, 10.0, 3.0, 0.5, key="pthr") / 100
+        go_scan = c.button("Scan Nifty 50", type="primary")
+        if go_scan:
+            frames = D.fetch_ohlcv_many(tuple(D.NIFTY50), "3y")
+            if not frames:
+                st.error("Could not download prices. Wait a minute and try again.")
+            else:
+                bar = st.progress(0.0, "Scoring stocks...")
+                res = M.rank_universe(frames, ph, pthr, lambda f, s: bar.progress(f, f"Scoring {s}..."))
+                bar.empty()
+                st.session_state["picks"] = (ph, pthr, res)
+        pk = st.session_state.get("picks")
+        if pk and pk[:2] == (ph, pthr) and not pk[2].empty:
+            res = pk[2].copy()
+            n_ok = int(res["Beat baseline"].sum())
+            st.caption(f"{n_ok} of {len(res)} stock models beat the naive baseline in backtests.")
+            only_ok = st.checkbox("Only show stocks whose model beat the baseline")
+            if only_ok:
+                res = res[res["Beat baseline"]]
+            if res.empty:
+                st.info("No stock passed that filter right now. That is a normal, honest outcome for short-term forecasts.")
+            else:
+                res["Beat baseline"] = res["Beat baseline"].map({True: "✅", False: "❌"})
+                fmt = {"Last close": "₹{:,.2f}", "Expected return": "{:+.2%}", "P(spike up)": "{:.1%}", "P(drop)": "{:.1%}",
+                       "RSI": "{:.0f}", "Vol 20d": "{:.0%}", "Score": "{:.0f}"}
+                st.subheader("Top 5 by score")
+                st.dataframe(res.head(5).style.format(fmt), hide_index=True, width="stretch")
+                with st.expander("Full ranking"):
+                    st.dataframe(res.style.format(fmt), hide_index=True, width="stretch")
+                st.caption("Score (0-100) = average percentile of the model's expected return and of (P(spike up) minus P(drop)). Expected return comes from a Ridge model; spike probabilities from random-forest classifiers.")
+
+# ------------------------------------------------------------------ data
+with tabs[7]:
     ind_full = I.add_indicators(df)
     st.dataframe(ind_full.tail(200).round(2), width="stretch")
     st.download_button("⬇️ Download prices + indicators (CSV)", ind_full.to_csv().encode(), f"{symbol}_analysis.csv", "text/csv")
-    st.divider()
-st.caption("© 2026 Rik Karmakar.")
+
+st.divider()
+st.caption("© 2026 Rik Karmakar · Built with Streamlit · Educational use only, not investment advice.")
